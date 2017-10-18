@@ -366,8 +366,10 @@ class soundplay:
                     self._as.set_succeeded(self._result)
 
         except Exception, e:
-            rospy.logerr('Exception in actionlib callback: %s'%str(e))
+            error = 'Exception in actionlib callback: %s' % str(e)
+            rospy.logerr(error)
             rospy.loginfo(traceback.format_exc())
+            self._as.set_aborted(result=self._result, text=error)
         finally:
             self.mutex.release()
             rospy.logdebug("done actionlib callback")
