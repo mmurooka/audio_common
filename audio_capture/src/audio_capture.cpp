@@ -1,193 +1,206 @@
-#include <stdio.h>
-#include <gst/gst.h>
-#include <gst/app/gstappsink.h>
+// -*- mode: C++ -*-
+/*********************************************************************
+ * Software License Agreement (BSD License)
+ *
+ *  Copyright (c) 2017, JSK Lab
+ *  All rights reserved.
+ *
+ *  Redistribution and use in source and binary forms, with or without
+ *  modification, are permitted provided that the following conditions
+ *  are met:
+ *
+ *   * Redistributions of source code must retain the above copyright
+ *     notice, this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above
+ *     copyright notice, this list of conditions and the following
+ *     disclaimer in the documentation and/o2r other materials provided
+ *     with the distribution.
+ *   * Neither the name of the JSK Lab nor the names of its
+ *     contributors may be used to endorse or promote products derived
+ *     from this software without specific prior written permission.
+ *
+ *  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ *  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ *  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+ *  FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+ *  COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+ *  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+ *  BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ *  LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ *  CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ *  LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+ *  ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ *  POSSIBILITY OF SUCH DAMAGE.
+ *********************************************************************/
+/*
+ * audio_capture.cpp
+ * Author: furushchev <furushchev@jsk.imi.i.u-tokyo.ac.jp>
+ */
+
 #include <boost/thread.hpp>
-
+#include <iterator>
+#include <sstream>
+#include <audio_common_msgs/AudioData.h>
 #include <ros/ros.h>
+#include <glibmm/main.h>
+#include <gstreamermm-1.0/gstreamermm.h>
+#include <gstreamermm-1.0/gstreamermm/audiotestsrc.h>
+#include <gstreamermm-1.0/gstreamermm/alsasrc.h>
+#include <gstreamermm-1.0/gstreamermm/appsink.h>
 
-#include "audio_common_msgs/AudioData.h"
 
-namespace audio_transport
+namespace audio_capture
 {
-  class RosGstCapture
+class AudioCapture
+{
+ public:
+  AudioCapture() : nh_(""), pnh_("~")
   {
-    public:
-      RosGstCapture()
-      {
-        _bitrate = 192;
+    std::string device = pnh_.param<std::string>("device", "default");
+    std::string format = pnh_.param<std::string>("format", "mp3");
+    int channels = pnh_.param("channels", 1);
+    bool test_mode = pnh_.param("test_mode", false);
 
-        std::string dst_type;
-        std::string device;
+    // params for mp3
+    int bitrate = pnh_.param("bitrate", 192);
 
-        // Need to encoding or publish raw wave data
-        ros::param::param<std::string>("~format", _format, "mp3");
+    // params for wav
+    int bitdepth = pnh_.param("bitdepth", 16);
+    int samplerate = pnh_.param("samplerate", 16000);
 
-        // The bitrate at which to encode the audio
-        ros::param::param<int>("~bitrate", _bitrate, 192);
+    pub_msg_.reset(new audio_common_msgs::AudioData);
+    pub_audio_ = nh_.advertise<audio_common_msgs::AudioData>("audio", 10);
 
-        // only available for raw data
-        ros::param::param<int>("~channels", _channels, 1);
-        ros::param::param<int>("~depth", _depth, 16);
-        ros::param::param<int>("~sample_rate", _sample_rate, 16000);
 
-        // The destination of the audio
-        ros::param::param<std::string>("~dst", dst_type, "appsink");
+    // initialize gstreamer
+    Glib::RefPtr<Gst::Element> src;
+    pipeline_ = Gst::Pipeline::create();
+    pipeline_->get_bus()->add_watch(sigc::mem_fun(*this, &AudioCapture::onBusMessage));
 
-        // The source of the audio
-        //ros::param::param<std::string>("~src", source_type, "alsasrc");
-        ros::param::param<std::string>("~device", device, std::string());
+    if (test_mode)
+    {
+      Glib::RefPtr<Gst::AudioTestSrc> test_src = Gst::AudioTestSrc::create("source");
+      test_src->property_is_live() = true;
+      pipeline_->add(test_src);
+      src = Glib::RefPtr<Gst::Element>::cast_dynamic(test_src);
+    }
+    else
+    {
+      Glib::RefPtr<Gst::AlsaSrc> alsa_src = Gst::AlsaSrc::create("source");
+      alsa_src->property_device() = device;
+      pipeline_->add(alsa_src);
+      src = Glib::RefPtr<Gst::Element>::cast_dynamic(alsa_src);
+    }
 
-        _pub = _nh.advertise<audio_common_msgs::AudioData>("audio", 10, true);
+    Glib::RefPtr<Gst::AudioConvert> convert = Gst::AudioConvert::create("convert");
+    pipeline_->add(convert);
+    src->link(convert);
 
-        _loop = g_main_loop_new(NULL, false);
-        _pipeline = gst_pipeline_new("ros_pipeline");
-        _bus = gst_pipeline_get_bus(GST_PIPELINE(_pipeline));
-        gst_bus_add_signal_watch(_bus);
-        g_signal_connect(_bus, "message::error",
-                         G_CALLBACK(onMessage), this);
-        g_object_unref(_bus);
+    Glib::RefPtr<Gst::AppSink> app_sink = Gst::AppSink::create("sink");
+    app_sink->property_max_buffers() = 100;
+    app_sink->property_emit_signals() = true;
+    app_sink->property_drop() = true;
+    if (format == "wav" || format == "wave")
+    {
+      std::ostringstream caps;
+      caps << "audio/x-raw,channels=" << channels;
+      caps << ",format=S" << bitdepth << (bitdepth > 8 ? "LE" : "");
+      caps << ",rate=" << samplerate;
+      app_sink->property_caps() = Gst::Caps::create_from_string(caps.str());
+    }
+    app_sink->signal_new_sample().connect(sigc::mem_fun(*this, &AudioCapture::onNewSample));
+    pipeline_->add(app_sink);
 
-        // We create the sink first, just for convenience
-        if (dst_type == "appsink")
+    if (format == "mp3")
+    {
+      Glib::RefPtr<Gst::Element> lamemp3enc = Gst::ElementFactory::create_element("lamemp3enc");
+      lamemp3enc->property("target", 1); // bitrate
+      lamemp3enc->property("bitrate", bitrate);
+      pipeline_->add(lamemp3enc);
+      convert->link(lamemp3enc);
+      lamemp3enc->link(app_sink);
+    }
+    else
+    {
+      convert->link(app_sink);
+    }
+    app_sink_ = app_sink;
+
+    gst_thread_ = boost::thread(boost::bind(&AudioCapture::start, this));
+  }
+
+  ~AudioCapture()
+  {
+    if (mainloop_)
+    {
+      mainloop_->quit();
+    }
+    gst_thread_.join();
+  }
+
+  void start()
+  {
+    pipeline_->set_state(Gst::STATE_PLAYING);
+    mainloop_ = Glib::MainLoop::create();
+    mainloop_->run();
+    pipeline_->set_state(Gst::STATE_NULL);
+  }
+
+ protected:
+
+  bool onBusMessage(const Glib::RefPtr<Gst::Bus>& bus, const Glib::RefPtr<Gst::Message>& msg)
+  {
+    switch (msg->get_message_type())
+    {
+      case Gst::MESSAGE_EOS:
+        ros::shutdown();
+        break;
+      case Gst::MESSAGE_ERROR:
         {
-          _sink = gst_element_factory_make("appsink", "sink");
-          g_object_set(G_OBJECT(_sink), "emit-signals", true, NULL);
-          g_object_set(G_OBJECT(_sink), "max-buffers", 100, NULL);
-          g_signal_connect( G_OBJECT(_sink), "new-buffer",
-                            G_CALLBACK(onNewBuffer), this);
+          Glib::Error err = Glib::RefPtr<Gst::MessageError>::cast_static(msg)->parse();
+          ROS_ERROR_STREAM("Failed in Gstreamer: " << err.what());
+          ros::shutdown();
+          break;
         }
-        else
-        {
-          printf("file sink\n");
-          _sink = gst_element_factory_make("filesink", "sink");
-          g_object_set( G_OBJECT(_sink), "location", dst_type.c_str(), NULL);
-        }
+      default:
+        break;
+    }
+    return true;
+  }
 
-        _source = gst_element_factory_make("alsasrc", "source");
-        _convert = gst_element_factory_make("audioconvert", "convert");
-
-        if (!device.empty())
-        {
-          g_object_set(G_OBJECT(_source), "device", device.c_str(), NULL);
-        }
-
-        gboolean link_ok;
-
-        if (_format == "mp3"){
-          _encode = gst_element_factory_make("lame", "encoder");
-          g_object_set( G_OBJECT(_encode), "preset", 1001, NULL);
-          g_object_set( G_OBJECT(_encode), "bitrate", _bitrate, NULL);
-
-          gst_bin_add_many( GST_BIN(_pipeline), _source, _convert, _encode, _sink, NULL);
-          link_ok = gst_element_link_many(_source, _convert, _encode, _sink, NULL);
-        } else if (_format == "wave") {
-          GstCaps *caps;
-          caps = gst_caps_new_simple("audio/x-raw-int",
-                                     "channels", G_TYPE_INT, _channels,
-                                     "width",    G_TYPE_INT, _depth,
-                                     "depth",    G_TYPE_INT, _depth,
-                                     "rate",     G_TYPE_INT, _sample_rate,
-                                     "signed",   G_TYPE_BOOLEAN, TRUE,
-                                     NULL);
-
-          g_object_set( G_OBJECT(_sink), "caps", caps, NULL);
-          gst_caps_unref(caps);
-          gst_bin_add_many( GST_BIN(_pipeline), _source, _sink, NULL);
-          link_ok = gst_element_link_many( _source, _sink, NULL);
-        } else {
-          ROS_ERROR_STREAM("format must be \"wave\" or \"mp3\"");
-          exitOnMainThread(1);
-        }
-        /*}
-        else
-        {
-          _sleep_time = 10000;
-          _source = gst_element_factory_make("filesrc", "source");
-          g_object_set(G_OBJECT(_source), "location", source_type.c_str(), NULL);
-
-          gst_bin_add_many( GST_BIN(_pipeline), _source, _sink, NULL);
-          gst_element_link_many(_source, _sink, NULL);
-        }
-        */
-
-        if (!link_ok) {
-          ROS_ERROR_STREAM("Unsupported media type.");
-          exitOnMainThread(1);
-        }
-
-        gst_element_set_state(GST_ELEMENT(_pipeline), GST_STATE_PLAYING);
-
-        _gst_thread = boost::thread( boost::bind(g_main_loop_run, _loop) );
-      }
-
-      ~RosGstCapture()
+  Gst::FlowReturn onNewSample()
+  {
+    Glib::RefPtr<Gst::Sample> sample = app_sink_->pull_sample();
+    Glib::RefPtr<Gst::Buffer> buffer = sample->get_buffer();
+    if (buffer)
+    {
+      Glib::RefPtr<Gst::MapInfo> map(new Gst::MapInfo);
+      if (buffer->map(map, Gst::MAP_READ))
       {
-        g_main_loop_quit(_loop);
-        gst_element_set_state(_pipeline, GST_STATE_NULL);
-        gst_object_unref(_pipeline);
-        g_main_loop_unref(_loop);
+        pub_msg_->data = std::vector<uint8_t>(map->get_data(), map->get_data() + map->get_size());
+        buffer->unmap(map);
+        pub_audio_.publish(*pub_msg_);
       }
+    }
+    return Gst::FLOW_OK;
+  }
 
-      void exitOnMainThread(int code)
-      {
-        exit(code);
-      }
+  ros::NodeHandle nh_, pnh_;
+  ros::Publisher pub_audio_;
+  boost::shared_ptr<audio_common_msgs::AudioData> pub_msg_;
 
-      void publish( const audio_common_msgs::AudioData &msg )
-      {
-        _pub.publish(msg);
-      }
-
-      static GstFlowReturn onNewBuffer (GstAppSink *appsink, gpointer userData)
-      {
-        RosGstCapture *server = reinterpret_cast<RosGstCapture*>(userData);
-
-        GstBuffer *buffer;
-        g_signal_emit_by_name(appsink, "pull-buffer", &buffer);
-
-        audio_common_msgs::AudioData msg;
-        msg.data.resize( buffer->size );
-        memcpy( &msg.data[0], buffer->data, buffer->size);
-
-        server->publish(msg);
-
-        return GST_FLOW_OK;
-      }
-
-      static gboolean onMessage (GstBus *bus, GstMessage *message, gpointer userData)
-      {
-        RosGstCapture *server = reinterpret_cast<RosGstCapture*>(userData);
-        GError *err;
-        gchar *debug;
-
-        gst_message_parse_error(message, &err, &debug);
-        ROS_ERROR_STREAM("gstreamer: " << err->message);
-        g_error_free(err);
-        g_free(debug);
-        g_main_loop_quit(server->_loop);
-        server->exitOnMainThread(1);
-        return FALSE;
-      }
-
-    private:
-      ros::NodeHandle _nh;
-      ros::Publisher _pub;
-
-      boost::thread _gst_thread;
-
-      GstElement *_pipeline, *_source, *_sink, *_convert, *_encode;
-      GstBus *_bus;
-      int _bitrate, _channels, _depth, _sample_rate;
-      GMainLoop *_loop;
-      std::string _format;
-  };
+  boost::thread gst_thread_;
+  Glib::RefPtr<Glib::MainLoop> mainloop_;
+  Glib::RefPtr<Gst::Pipeline> pipeline_;
+  Glib::RefPtr<Gst::AppSink> app_sink_;
+};
 }
 
-int main (int argc, char **argv)
+int main(int argc, char** argv)
 {
   ros::init(argc, argv, "audio_capture");
-  gst_init(&argc, &argv);
-
-  audio_transport::RosGstCapture server;
+  Gst::init(argc, argv);
+  audio_capture::AudioCapture cap;
   ros::spin();
+  return 0;
 }
