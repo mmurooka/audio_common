@@ -189,7 +189,7 @@ class SoundPlayNode(object):
                 uri = msg.arg
         elif msg.sound == SoundRequest.SAY:
             basename = msg.arg + "_" + msg.arg2
-            basename = re.sub(',|\.|/|\\\\| ', '_', basename)
+            basename = re.sub(r',|\.|/|\\| |\'|`|"|;|:|\(|\)|%|~', '_', basename)
             uri = os.path.join(self.tmpdir, basename + ".wav")
         else:
             uri, _ = SoundPlayNode.builtin_sounds[msg.sound]
