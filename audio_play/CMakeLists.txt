@@ -5,7 +5,11 @@ project(audio_play)
 find_package(catkin REQUIRED COMPONENTS roscpp audio_common_msgs)
 
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(Gst gstreamermm-1.0 REQUIRED)
+pkg_check_modules(Gst gstreamermm-1.0)
+if (NOT Gst_FOUND)
+  message(WARNING "Gstreamermm not found. Skip building...")
+  return()
+endif()
 
 find_package(Boost REQUIRED COMPONENTS thread)
 
